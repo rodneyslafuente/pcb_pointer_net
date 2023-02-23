@@ -1,219 +1,172 @@
-"""
-Module implementing the pointer network proposed at: https://arxiv.org/abs/1506.03134
-
-The implementation try to follows the variables naming conventions
-
-ei: Encoder hidden state
-
-di: Decoder hidden state
-di_prime: Attention aware decoder state
-
-W1: Learnable matrix (Attention layer)
-W2: Learnable matrix (Attention layer)
-V: Learnable parameter (Attention layer)
-
-uj: Energy vector (Attention Layer)
-aj: Attention mask over the input
-"""
-import random
 from typing import Tuple
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-
-from data import sample, batch
-
-HIDDEN_SIZE = 256
-
-BATCH_SIZE = 32
-STEPS_PER_EPOCH = 500
-EPOCHS = 10
 
 
 class Encoder(nn.Module):
-  def __init__(self, hidden_size: int):
-    super(Encoder, self).__init__()
-    self.lstm = nn.LSTM(1, hidden_size, batch_first=True)
-  
-  def forward(self, x: torch.Tensor):
-    # x: (BATCH, ARRAY_LEN, 1)
-    return self.lstm(x)
+    """
+    Encoder class for PCB Pointer Network
+    """
+
+    def __init__(self, hidden_size: int) -> None:
+        """
+        Initiate Encoder
+        """
+
+        super().__init__()
+
+        # Input size is 2, given two coordinates per position
+        self.lstm = nn.LSTM(input_size=2, hidden_size=hidden_size, batch_first=True)
+
+    def forward(
+        self, positions_batch: torch.Tensor
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Encoder forward pass
+
+        :param Tensor positions: PCB component positions (batch_size, num_positions, 2)
+        :return: LSTM return value (output, (hidden_states, cell_states))
+        """
+
+        return self.lstm(positions_batch)
 
 
 class Attention(nn.Module):
-  def __init__(self, hidden_size, units):
-    super(Attention, self).__init__()
-    self.W1 = nn.Linear(hidden_size, units, bias=False)
-    self.W2 = nn.Linear(hidden_size, units, bias=False)
-    self.V =  nn.Linear(units, 1, bias=False)
+    """
+    Attention class for PCB Pointer Network
+    """
 
-  def forward(self, 
-              encoder_out: torch.Tensor, 
-              decoder_hidden: torch.Tensor):
-    # encoder_out: (BATCH, ARRAY_LEN, HIDDEN_SIZE)
-    # decoder_hidden: (BATCH, HIDDEN_SIZE)
+    def __init__(self, hidden_size: int) -> None:
+        """
+        Initiate Attention
+        """
 
-    # Add time axis to decoder hidden state
-    # in order to make operations compatible with encoder_out
-    # decoder_hidden_time: (BATCH, 1, HIDDEN_SIZE)
-    decoder_hidden_time = decoder_hidden.unsqueeze(1)
+        super().__init__()
 
-    # uj: (BATCH, ARRAY_LEN, ATTENTION_UNITS)
-    # Note: we can add the both linear outputs thanks to broadcasting
-    uj = self.W1(encoder_out) + self.W2(decoder_hidden_time)
-    uj = torch.tanh(uj)
+        self.W_1 = nn.Linear(hidden_size, hidden_size)
+        self.W_2 = nn.Linear(hidden_size, hidden_size)
+        self.V = nn.Linear(hidden_size, 1)
 
-    # uj: (BATCH, ARRAY_LEN, 1)
-    uj = self.V(uj)
+    def forward(self, decoder_hidden: torch.Tensor, encoder_outputs: torch.Tensor):
+        """
+        Attention forward pass
 
-    # Attention mask over inputs
-    # aj: (BATCH, ARRAY_LEN, 1)
-    aj = F.softmax(uj, dim=1)
+        :param Tensor decoder_hidden: Decoder hidden state (batch_size, hidden_size)
+        :param Tensor encoder_outputs: Encoder output (batch_size, components_size, hidden_size)
+        :return: Tuple - (attention aware hidden state, attention)
+        """
 
-    # di_prime: (BATCH, HIDDEN_SIZE)
-    di_prime = aj * encoder_out
-    di_prime = di_prime.sum(1)
-    
-    return di_prime, uj.squeeze(-1)
-    
+        D = self.W_1(decoder_hidden).unsqueeze(1)
+        E = self.W_2(encoder_outputs)
+        attention = torch.softmax(self.V(torch.tanh(D + E)), dim=1)
+
+        attentioned_encoder_outputs = torch.mul(encoder_outputs, attention)
+        atttention_aware_hidden_state = attentioned_encoder_outputs.sum(1)
+        # (batch_size, components_size)
+        attention = attention.squeeze(2)
+
+        return atttention_aware_hidden_state, attention
+
 
 class Decoder(nn.Module):
-  def __init__(self, 
-               hidden_size: int,
-               attention_units: int = 10):
-    super(Decoder, self).__init__()
-    self.lstm = nn.LSTM(hidden_size + 1, hidden_size, batch_first=True)
-    self.attention = Attention(hidden_size, attention_units)
+    """
+    Decoder for PCB Pointer Network
+    """
 
-  def forward(self, 
-              x: torch.Tensor, 
-              hidden: Tuple[torch.Tensor], 
-              encoder_out: torch.Tensor):
-    # x: (BATCH, 1, 1) 
-    # hidden: (1, BATCH, HIDDEN_SIZE)
-    # encoder_out: (BATCH, ARRAY_LEN, HIDDEN_SIZE)
-    # For a better understanding about hidden shapes read: https://pytorch.org/docs/stable/nn.html#lstm
-    
-    # Get hidden states (not cell states) 
-    # from the first and unique LSTM layer 
-    ht = hidden[0][0]  # ht: (BATCH, HIDDEN_SIZE)
+    def __init__(self, hidden_size: int) -> None:
+        """
+        Initiate Decoder
+        """
 
-    # di: Attention aware hidden state -> (BATCH, HIDDEN_SIZE)
-    # att_w: Not 'softmaxed', torch will take care of it -> (BATCH, ARRAY_LEN)
-    di, att_w = self.attention(encoder_out, ht)
-    
-    # Append attention aware hidden state to our input
-    # x: (BATCH, 1, 1 + HIDDEN_SIZE)
-    x = torch.cat([di.unsqueeze(1), x], dim=2)
-    
-    # Generate the hidden state for next timestep
-    _, hidden = self.lstm(x, hidden)
-    return hidden, att_w
+        super().__init__()
 
+        self.attention = Attention(hidden_size)
 
-class PointerNetwork(nn.Module):
-  def __init__(self, 
-               encoder: nn.Module, 
-               decoder: nn.Module):
-    super(PointerNetwork, self).__init__()
-    self.encoder = encoder
-    self.decoder = decoder
+        # input_size is hidden_size + 2 given position coordinates
+        self.lstm = nn.LSTM(hidden_size + 2, hidden_size, batch_first=True)
 
-  def forward(self, 
-              x: torch.Tensor, 
-              y: torch.Tensor, 
-              teacher_force_ratio=.5):
-    # x: (BATCH_SIZE, ARRAY_LEN)
-    # y: (BATCH_SIZE, ARRAY_LEN)
+    def forward(
+        self,
+        position_batch: torch.Tensor,
+        encoder_output: torch.Tensor,
+        decoder_hidden: torch.Tensor,
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """
+        Decoder forward pass
 
-    # Array elements as features
-    # encoder_in: (BATCH, ARRAY_LEN, 1)
-    encoder_in = x.unsqueeze(-1).type(torch.float)
+        :input Tensor position_batch: (batch_size, 1, 2)
+        :input Tensor encoder_output: (batch_size, components_size, hidden_size)
+        :input Tensor decoder_hidden: Tuple of LSTM (hidden state, cell state)
+        :return: Tuple of LSTM hidden states, attention (batch_size, components_size)
+        """
 
-    # out: (BATCH, ARRAY_LEN, HIDDEN_SIZE)
-    # hs: tuple of (NUM_LAYERS, BATCH, HIDDEN_SIZE)
-    out, hs = encoder(encoder_in)
+        # extract first LSTM's hidden state, not including cell state, to compute attention with
+        hidden_state = decoder_hidden[0][0]
 
-    # Accum loss throughout timesteps
-    loss = 0
+        attention_aware_hidden_state, attention = self.attention(
+            hidden_state, encoder_output
+        )
+        attention_aware_hidden_state = attention_aware_hidden_state.unsqueeze(1)
 
-    # Save outputs at each timestep
-    # outputs: (ARRAY_LEN, BATCH)
-    outputs = torch.zeros(out.size(1), out.size(0), dtype=torch.long)
-    
-    # First decoder input is always 0
-    # dec_in: (BATCH, 1, 1)
-    dec_in = torch.zeros(out.size(0), 1, 1, dtype=torch.float)
-    
-    for t in range(out.size(1)):
-      hs, att_w = decoder(dec_in, hs, out)
-      predictions = F.softmax(att_w, dim=1).argmax(1)
+        # (batch_size, 1, hidden_size + 2)
+        lstm_input = torch.cat([attention_aware_hidden_state, position_batch], dim=2)
 
-      # Pick next index
-      # If teacher force the next element will we the ground truth
-      # otherwise will be the predicted value at current timestep
-      teacher_force = random.random() < teacher_force_ratio
-      idx = y[:, t] if teacher_force else predictions
-      dec_in = torch.stack([x[b, idx[b].item()] for b in range(x.size(0))])
-      dec_in = dec_in.view(out.size(0), 1, 1).type(torch.float)
+        # next_hidden is tuple - (hidden_state, cell_state)
+        _, next_hidden = self.lstm(lstm_input, decoder_hidden)
 
-      # Add cross entropy loss (F.log_softmax + nll_loss)
-      loss += F.cross_entropy(att_w, y[:, t])
-      outputs[t] = predictions
-
-    # Weight losses, so every element in the batch 
-    # has the same 'importance' 
-    batch_loss = loss / y.size(0)
-
-    return outputs, batch_loss
+        return next_hidden, attention
 
 
-def train(model, optimizer, epoch, clip=1.):
-  """Train single epoch"""
-  print('Epoch [{}] -- Train'.format(epoch))
-  for step in range(STEPS_PER_EPOCH):
-    optimizer.zero_grad()
+class PCBPointerNet(nn.Module):
+    """
+    PCB Pointer Network
+    """
 
-    # Forward
-    x, y = batch(BATCH_SIZE)
-    out, loss = model(x, y)
+    def __init__(self, hidden_size: int) -> None:
+        """
+        Initiate Pointer Network
+        """
 
-    # Backward
-    loss.backward()
-    nn.utils.clip_grad_norm_(model.parameters(), clip)
-    optimizer.step()
+        super().__init__()
 
-    if (step + 1) % 100 == 0:
-      print('Epoch [{}] loss: {}'.format(epoch, loss.item()))
+        self.encoder = Encoder(hidden_size)
+        self.decoder = Decoder(hidden_size)
 
+    def forward(self, positions_batch: torch.Tensor) -> torch.Tensor:
+        """
+        Pointer Network forward pass
 
-@torch.no_grad()
-def evaluate(model, epoch):
-  """Evaluate after a train epoch"""
-  print('Epoch [{}] -- Evaluate'.format(epoch))
+        :input Tensor positions: Batch of positions (batch_size, components_size, 2)
+        :input Tensor orders: Bacth of orders (batch_size, components_size)
+        :return: Pointers (batch_size, components_size, components_size)
+        """
 
-  x_val, y_val = batch(4)
-  
-  out, _ = model(x_val, y_val, teacher_force_ratio=0.)
-  out = out.permute(1, 0)
+        components_size = positions_batch.shape[1]
+        batch_size = positions_batch.shape[0]
 
-  for i in range(out.size(0)):
-    print('{} --> {} --> {}'.format(
-      x_val[i], 
-      x_val[i].gather(0, out[i]), 
-      x_val[i].gather(0, y_val[i])
-    ))
+        # encode positions
+        encoder_output, hidden_states = self.encoder(positions_batch)
 
+        # initialize decoder input
+        decoder_input = torch.zeros((batch_size, 1, 2))
 
-encoder = Encoder(HIDDEN_SIZE)
-decoder = Decoder(HIDDEN_SIZE)
-ptr_net = PointerNetwork(encoder, decoder)
+        pointers = torch.zeros((batch_size, 0, components_size))
 
-optimizer = optim.Adam(ptr_net.parameters())
+        # decode encoder output
+        for _ in range(components_size):
+            hidden_states, attention = self.decoder(
+                decoder_input, encoder_output, hidden_states
+            )
 
-for epoch in range(EPOCHS):
-  train(ptr_net, optimizer, epoch + 1)
-  evaluate(ptr_net, epoch + 1)
-  
+            pointers = torch.cat([pointers, attention.unsqueeze(1)], dim=1)
+
+            predictions = torch.argmax(attention, dim=1)
+
+            # choose predictions from positions_batch as input for next decoder step
+            for batch_num in range(batch_size):
+                decoder_input[batch_num] = positions_batch[
+                    batch_num, predictions[batch_num]
+                ]
+
+        return pointers
